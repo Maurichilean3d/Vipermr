@@ -1,196 +1,427 @@
 
 <!DOCTYPE html>
-<html>
-  <head>
-    <title>Snake Attack MR - Passthrough</title>
-    <script src="https://aframe.io/releases/1.5.0/aframe.min.js"></script>
-    <script src="https://unpkg.com/aframe-look-at-component@0.8.0/dist/aframe-look-at-component.min.js"></script>
-  </head>
-  <body>
-    <script>
-      // COMPONENTE: Gestor del Juego
-      AFRAME.registerComponent('game-logic', {
-        init: function() {
-          this.score = 0;
-          this.isGameOver = false;
-          this.spawnTimer = 0;
-          this.spawnInterval = 3000; // 3 segundos al inicio
-          this.camera = document.querySelector('#camera');
-          this.scoreText = document.querySelector('#scoreText');
-          
-          // Sonido simulado (log)
-          console.log("Juego MR Iniciado");
-        },
-        tick: function(time, delta) {
-          if (this.isGameOver) return;
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+  <title>Snake MR - Diamond Occlusion Tech</title>
+  <style>
+    body { margin: 0; overflow: hidden; background-color: #000; font-family: 'Segoe UI', sans-serif; }
+    canvas { display: block; }
+    #overlay {
+        position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+        display: flex; flex-direction: column; align-items: center; justify-content: center;
+        pointer-events: none; z-index: 10;
+    }
+    #btn-vr {
+        pointer-events: auto; padding: 15px 40px; background: #ffaa00; border: none;
+        border-radius: 30px; font-weight: 900; font-size: 18px; color: #000;
+        box-shadow: 0 0 20px rgba(255, 170, 0, 0.6); cursor: pointer;
+    }
+    #score-board {
+        position: absolute; top: 20px; font-size: 24px; color: #ffaa00; 
+        text-shadow: 0 0 10px rgba(0,0,0,0.8); font-weight: bold;
+        display: none;
+    }
+    #damage {
+        position: absolute; inset: 0; background: red; opacity: 0; transition: opacity 0.2s; pointer-events: none;
+    }
+  </style>
+</head>
+<body>
 
-          this.spawnTimer += delta;
-          if (this.spawnTimer > this.spawnInterval) {
-            this.spawnSnakeEvent();
-            this.spawnTimer = 0;
-            // Aumentar dificultad: más rápido cada vez
-            if (this.spawnInterval > 800) this.spawnInterval -= 50;
-          }
+<div id="damage"></div>
+<div id="overlay">
+    <div id="score-board">ESQUIVADAS: 0</div>
+    <button id="btn-vr">INICIAR MR (QUEST 3)</button>
+</div>
 
-          this.checkCollisions();
-        },
-        spawnSnakeEvent: function() {
-          // 1. Calcular posición en "Paredes" (Esfera de 3m alrededor del usuario)
-          // Esto simula las paredes de tu habitación
-          const angleX = Math.random() * Math.PI * 2;
-          const angleY = (Math.random() - 0.5) * Math.PI; // Altura variable (Suelo/Techo)
-          const radius = 3; // Distancia simulada a la pared
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
 
-          const x = Math.cos(angleX) * Math.cos(angleY) * radius;
-          const y = Math.sin(angleY) * radius;
-          const z = Math.sin(angleX) * Math.cos(angleY) * radius;
-          
-          const spawnPos = {x: x, y: y, z: z};
+<script type="module">
+    import * as THREE from 'three';
+    import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 
-          // 2. Crear la "Grieta" visual en esa posición
-          this.createCrack(spawnPos);
-        },
+    // ==========================================
+    // 1. SHADERS DE OCLUSIÓN (EXTRAÍDOS DE TU CÓDIGO)
+    // ==========================================
+    const depthVS = `#version 300 es
+      in vec2 aPos; out vec2 vUv;
+      void main(){ vUv = aPos * 0.5 + 0.5; gl_Position = vec4(aPos, 0.0, 1.0); }
+    `;
 
-        createCrack: function(pos) {
-            const scene = this.el.sceneEl;
+    const depthFS = `#version 300 es
+      precision highp float; precision highp sampler2D;
+      in vec2 vUv; uniform sampler2D uDepth; uniform float uRawToMeters; uniform mat4 uProj;
+      out vec4 outColor;
+      float decode(vec4 la){ return (la.r * 255.0 * 256.0 + la.a * 255.0); }
+      void main(){
+        float zMeters = decode(texture(uDepth, vUv)) * uRawToMeters;
+        if(zMeters <= 0.0) discard;
+        float z = -zMeters;
+        // Convertir profundidad lineal a Depth Buffer proyectado
+        float clipZ = uProj[2][2] * z + uProj[3][2];
+        float clipW = uProj[2][3] * z + uProj[3][3];
+        gl_FragDepth = clamp((clipZ / clipW) * 0.5 + 0.5, 0.0, 1.0);
+        
+        // No dibujamos color, solo escribimos en el Depth Buffer
+        outColor = vec4(0.0); 
+      }
+    `;
+
+    // ==========================================
+    // 2. CONFIGURACIÓN E INICIALIZACIÓN
+    // ==========================================
+    let camera, scene, renderer;
+    let xrSession = null, xrRefSpace = null, xrGlBinding = null;
+    let depthProgram = null, depthVao = null, depthTex = null;
+    let occlusionEnabled = true;
+
+    // Variables del Juego
+    let snakes = [];
+    let debrisList = [];
+    let lastSpawnTime = 0;
+    let spawnInterval = 3000;
+    let score = 0;
+    let isGameOver = false;
+    const playerPos = new THREE.Vector3(); // Posición de la cabeza
+
+    init();
+
+    function init() {
+        const container = document.createElement('div');
+        document.body.appendChild(container);
+
+        scene = new THREE.Scene();
+
+        // Cámara
+        camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+        
+        // Luces (para que se vean las víboras)
+        const hemiLight = new THREE.HemisphereLight(0xffffff, 0x444444, 1.5);
+        hemiLight.position.set(0, 4, 0);
+        scene.add(hemiLight);
+        
+        const dirLight = new THREE.DirectionalLight(0xffaa00, 2); // Luz cálida "ámbar" como tu estilo
+        dirLight.position.set(2, 3, 1);
+        scene.add(dirLight);
+
+        // Renderizador
+        renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.xr.enabled = true;
+        container.appendChild(renderer.domElement);
+
+        // Botón VR
+        document.getElementById('btn-vr').addEventListener('click', startMR);
+
+        // Loop principal
+        renderer.setAnimationLoop(render);
+        
+        window.addEventListener('resize', onResize);
+    }
+
+    async function startMR() {
+        if (!navigator.xr) { alert("WebXR no soportado"); return; }
+        
+        const sessionInit = {
+            requiredFeatures: ['local-floor'],
+            optionalFeatures: ['dom-overlay', 'depth-sensing'], // CRUCIAL: depth-sensing
+            depthSensing: {
+                usagePreference: ['cpu-optimized'],
+                dataFormatPreference: ['luminance-alpha']
+            },
+            domOverlay: { root: document.body }
+        };
+
+        try {
+            xrSession = await navigator.xr.requestSession('immersive-ar', sessionInit);
+            renderer.xr.setSession(xrSession);
             
-            // Contenedor para el evento
-            const pivot = document.createElement('a-entity');
-            pivot.setAttribute('position', pos);
-            pivot.setAttribute('look-at', '#camera'); // Que la grieta mire al usuario
-            
-            // Imagen de la grieta (Circular negra para simular agujero)
-            const crack = document.createElement('a-circle');
-            crack.setAttribute('color', '#111'); // Casi negro
-            crack.setAttribute('radius', 0.01); // Empieza pequeña
-            crack.setAttribute('material', 'shader: flat; opacity: 0.9');
-            
-            // Animación: La grieta se abre
-            crack.setAttribute('animation', 'property: radius; to: 0.4; dur: 1000; easing: easeOutElastic');
-            
-            pivot.appendChild(crack);
-            scene.appendChild(pivot);
-
-            // 3. Salida de la víbora después de 1 segundo
-            setTimeout(() => {
-                this.explodeDebris(pivot);
-                this.spawnSnake(pivot, pos);
-            }, 1000);
-
-            // Limpiar la grieta después de que pase todo
-            setTimeout(() => {
-                if(pivot.parentNode) pivot.parentNode.removeChild(pivot);
-            }, 4000);
-        },
-
-        explodeDebris: function(parentEntity) {
-            // Generar escombros que saltan hacia el jugador
-            for(let i=0; i<8; i++) {
-                let debris = document.createElement('a-box');
-                debris.setAttribute('color', '#333');
-                debris.setAttribute('scale', '0.05 0.05 0.05');
-                debris.setAttribute('position', '0 0 0');
-                
-                // Fisica simple: Moverse hacia adelante (Z positivo local) y dispersarse
-                let destX = (Math.random() - 0.5) * 2;
-                let destY = (Math.random() - 0.5) * 2;
-                
-                debris.setAttribute('animation', `property: position; to: ${destX} ${destY} 2; dur: 800; easing: easeOutQuad`);
-                debris.setAttribute('animation__rot', `property: rotation; to: ${Math.random()*360} ${Math.random()*360} 0; dur: 800`);
-                
-                parentEntity.appendChild(debris);
-            }
-        },
-
-        spawnSnake: function(parentEntity, worldPos) {
-            // Determinar tipo de víbora por puntuación
-            let isBig = this.score > 5;
-            let speed = isBig ? 1500 : 800; // Ms en llegar a ti
-            let color = isBig ? '#5D4037' : '#D32F2F'; // Boa vs Coralillo
-            let scale = isBig ? '0.2 0.2 0.2' : '0.08 0.08 0.08';
-            
-            const snake = document.createElement('a-entity');
-            snake.setAttribute('position', '0 0 -1'); // Empieza "dentro" de la pared (atrás de la grieta)
-            snake.classList.add('enemy');
-            
-            // Modelo visual
-            const head = document.createElement('a-sphere');
-            head.setAttribute('radius', 0.2);
-            head.setAttribute('color', isBig ? 'green' : 'black');
-            head.setAttribute('scale', scale);
-            
-            const body = document.createElement('a-cylinder');
-            body.setAttribute('height', 2);
-            body.setAttribute('radius', 0.1);
-            body.setAttribute('color', color);
-            body.setAttribute('rotation', '90 0 0');
-            body.setAttribute('position', '0 0 -1'); // Cola hacia atrás
-            body.setAttribute('scale', scale);
-
-            snake.appendChild(head);
-            snake.appendChild(body);
-            parentEntity.appendChild(snake);
-
-            // ANIMACIÓN DE ATAQUE: Salta hacia la cámara (Z local positivo)
-            // Calculamos la distancia real a la cámara para que parezca que te golpea
-            let dist = 3.5; // Un poco más del radio para asegurar impacto visual
-            
-            snake.setAttribute('animation', `property: position; to: 0 0 ${dist}; dur: ${speed}; easing: linear`);
-
-            // Evento al terminar el ataque (si no te dio)
-            setTimeout(() => {
-                if (!this.isGameOver) {
-                    this.score++;
-                    this.scoreText.setAttribute('value', 'Esquivadas: ' + this.score);
-                }
-            }, speed);
-        },
-
-        checkCollisions: function() {
-            // Detección simple: Si una víbora está muy cerca de la cámara (0,0,0 local)
-            // Como las víboras son hijas de pivotes rotados, usamos World Position
-            let playerPos = new THREE.Vector3();
-            this.camera.object3D.getWorldPosition(playerPos);
-
-            let enemies = document.querySelectorAll('.enemy');
-            enemies.forEach(enemy => {
-                let enemyPos = new THREE.Vector3();
-                enemy.object3D.getWorldPosition(enemyPos);
-                
-                if (playerPos.distanceTo(enemyPos) < 0.4) {
-                    this.gameOver();
-                }
+            xrSession.addEventListener('end', () => { 
+                xrSession = null; 
+                document.getElementById('score-board').style.display = 'none';
+                document.getElementById('btn-vr').style.display = 'block';
             });
-        },
 
-        gameOver: function() {
-            if(this.isGameOver) return;
-            this.isGameOver = true;
+            xrRefSpace = await xrSession.requestReferenceSpace('local-floor');
             
-            // Feedback visual: Pantalla roja
-            const feedback = document.querySelector('#damage');
-            feedback.setAttribute('visible', true);
-            this.scoreText.setAttribute('value', 'TE HAN MORDIDO! Reiniciando...');
-            
-            setTimeout(() => location.reload(), 2000);
+            // Inicializar el sistema de Oclusión (Tu código)
+            initDepthOcclusion(xrSession);
+
+            // UI
+            document.getElementById('btn-vr').style.display = 'none';
+            document.getElementById('score-board').style.display = 'block';
+            resetGame();
+
+        } catch (e) {
+            console.error(e);
+            alert("Error iniciando sesión AR: " + e.message);
         }
-      });
-    </script>
+    }
 
-    <a-scene 
-        webxr="optionalFeatures: hit-test, dom-overlay; overlay: true"
-        renderer="alpha: true"
-        background="color: transparent"
-        game-logic>
+    // Lógica extraída de tu código para compilar el shader de profundidad
+    function initDepthOcclusion(session) {
+        const gl = renderer.getContext();
+        xrGlBinding = new XRWebGLBinding(session, gl);
 
-      <a-entity id="camera" camera position="0 1.6 0" look-controls="magicWindowTrackingEnabled: false">
-          <a-text id="scoreText" value="Espera el ataque..." position="0 0.2 -1" align="center" width="2" color="white" shader="msdf" font="roboto"></a-text>
-          <a-plane id="damage" position="0 0 -0.1" width="2" height="2" color="red" material="transparent: true; opacity: 0.6" visible="false"></a-plane>
-      </a-entity>
+        // Compilar Vertex Shader
+        const vs = gl.createShader(gl.VERTEX_SHADER);
+        gl.shaderSource(vs, depthVS); gl.compileShader(vs);
+        if(!gl.getShaderParameter(vs, gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(vs));
 
-      <a-light type="directional" position="-1 2 1" intensity="1"></a-light>
-      <a-light type="ambient" intensity="0.6"></a-light>
+        // Compilar Fragment Shader
+        const fs = gl.createShader(gl.FRAGMENT_SHADER);
+        gl.shaderSource(fs, depthFS); gl.compileShader(fs);
+        if(!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(fs));
 
-    </a-scene>
-  </body>
+        // Link Programa
+        depthProgram = gl.createProgram();
+        gl.attachShader(depthProgram, vs);
+        gl.attachShader(depthProgram, fs);
+        gl.linkProgram(depthProgram);
+
+        // Crear Quad (pantalla completa para el depth)
+        depthVao = gl.createVertexArray();
+        gl.bindVertexArray(depthVao);
+        const vbo = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, -1,1, 1,-1, 1,1]), gl.STATIC_DRAW);
+        
+        const loc = gl.getAttribLocation(depthProgram, 'aPos');
+        gl.enableVertexAttribArray(loc);
+        gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+        depthTex = gl.createTexture();
+    }
+
+    function resetGame() {
+        score = 0;
+        spawnInterval = 3000;
+        isGameOver = false;
+        document.getElementById('score-board').textContent = "ESQUIVADAS: 0";
+        // Limpiar
+        snakes.forEach(s => scene.remove(s.mesh));
+        snakes = [];
+        debrisList.forEach(d => scene.remove(d));
+        debrisList = [];
+    }
+
+    // ==========================================
+    // 3. LÓGICA DEL JUEGO (VÍBORAS)
+    // ==========================================
+    
+    function spawnSnake() {
+        if (!xrSession) return;
+
+        // 1. Determinar posición aleatoria alrededor del jugador (simulando pared)
+        const angle = Math.random() * Math.PI * 2;
+        const height = 0.5 + Math.random() * 1.5; // Entre 0.5m y 2m de altura
+        const radius = 2.5; // Supuesta distancia a la pared
+
+        const spawnPos = new THREE.Vector3(
+            Math.cos(angle) * radius,
+            height,
+            Math.sin(angle) * radius
+        );
+
+        // 2. Determinar especie (Nivel)
+        const isBoa = score > 5;
+        const speed = isBoa ? 2.5 : 4.0; // Boa lenta pero grande, Coralillo rápida
+        const color = isBoa ? 0x5D4037 : 0xff0000;
+        const scale = isBoa ? 1.5 : 0.8;
+
+        // 3. Crear Mesh de la víbora
+        const group = new THREE.Group();
+        group.position.copy(spawnPos);
+        group.lookAt(playerPos); // Mirar al jugador
+
+        // Cabeza
+        const headGeo = new THREE.ConeGeometry(0.08 * scale, 0.2 * scale, 8);
+        headGeo.rotateX(-Math.PI/2);
+        const headMat = new THREE.MeshStandardMaterial({ color: isBoa ? 0x2E7D32 : 0x000000, roughness: 0.4 });
+        const head = new THREE.Mesh(headGeo, headMat);
+        group.add(head);
+
+        // Cuerpo (segmentos simples para rendimiento)
+        const bodyGeo = new THREE.CylinderGeometry(0.06 * scale, 0.04 * scale, 1.5 * scale, 8);
+        bodyGeo.rotateX(-Math.PI/2);
+        bodyGeo.translate(0, 0, -0.75 * scale); // Cola hacia atrás
+        const bodyMat = new THREE.MeshStandardMaterial({ color: color, roughness: 0.4 });
+        const body = new THREE.Mesh(bodyGeo, bodyMat);
+        group.add(body);
+
+        scene.add(group);
+
+        // 4. Efecto de Escombros (Explosión de pared)
+        spawnDebris(spawnPos, group.quaternion);
+
+        // Guardar referencia
+        snakes.push({
+            mesh: group,
+            velocity: new THREE.Vector3().subVectors(playerPos, spawnPos).normalize().multiplyScalar(speed),
+            life: 0
+        });
+    }
+
+    function spawnDebris(pos, rot) {
+        for(let i=0; i<8; i++) {
+            const geo = new THREE.BoxGeometry(0.05, 0.05, 0.05);
+            const mat = new THREE.MeshBasicMaterial({ color: 0x555555 });
+            const mesh = new THREE.Mesh(geo, mat);
+            
+            mesh.position.copy(pos);
+            mesh.position.x += (Math.random()-0.5)*0.3;
+            mesh.position.y += (Math.random()-0.5)*0.3;
+            
+            const vel = new THREE.Vector3(0,0,1).applyQuaternion(rot); // Hacia adelante
+            vel.add(new THREE.Vector3((Math.random()-0.5), (Math.random()-0.5), 0)); // Dispersión
+            vel.multiplyScalar(2 + Math.random());
+
+            scene.add(mesh);
+            debrisList.push({ mesh, vel, life: 1.0 });
+        }
+    }
+
+    function updateGame(delta, time) {
+        if (isGameOver) return;
+
+        // Spawner
+        if (time - lastSpawnTime > spawnInterval) {
+            spawnSnake();
+            lastSpawnTime = time;
+            if (spawnInterval > 800) spawnInterval -= 50; // Aumentar dificultad
+        }
+
+        // Obtener posición jugador
+        camera.getWorldPosition(playerPos);
+
+        // Mover Víboras
+        for (let i = snakes.length - 1; i >= 0; i--) {
+            const s = snakes[i];
+            
+            // Movimiento
+            const moveStep = s.velocity.clone().multiplyScalar(delta);
+            s.mesh.position.add(moveStep);
+            
+            // Ondulación simple (seno en eje X local)
+            s.mesh.rotation.z += Math.sin(time * 10) * 0.05; 
+
+            // Colisión con Jugador
+            const dist = s.mesh.position.distanceTo(playerPos);
+            if (dist < 0.3) {
+                gameOver();
+                return;
+            }
+
+            // Eliminar si pasó de largo
+            if (s.mesh.position.distanceTo(playerPos) > 5 && s.mesh.position.z > playerPos.z) { // Lógica simple de despawn
+                 scene.remove(s.mesh);
+                 snakes.splice(i, 1);
+                 score++;
+                 document.getElementById('score-board').textContent = "ESQUIVADAS: " + score;
+            }
+        }
+
+        // Mover Escombros
+        for (let i = debrisList.length - 1; i >= 0; i--) {
+            const d = debrisList[i];
+            d.mesh.position.add(d.vel.clone().multiplyScalar(delta));
+            d.mesh.rotation.x += delta * 5;
+            d.life -= delta;
+            if(d.life <= 0) {
+                scene.remove(d.mesh);
+                debrisList.splice(i, 1);
+            }
+        }
+    }
+
+    function gameOver() {
+        isGameOver = true;
+        const dmg = document.getElementById('damage');
+        dmg.style.opacity = 0.8;
+        setTimeout(() => dmg.style.opacity = 0, 300);
+        document.getElementById('score-board').textContent = "¡MORDIDO! Reiniciando...";
+        setTimeout(resetGame, 2000);
+    }
+
+    // ==========================================
+    // 4. RENDER LOOP (CON LA MAGIA DE OCLUSIÓN)
+    // ==========================================
+    function render(time, frame) {
+        const delta = 0.016; // Aprox 60fps
+        const now = performance.now();
+
+        if (frame) {
+            updateGame(delta, now);
+
+            // ==============================================
+            // AQUÍ ESTÁ LA LÓGICA CLAVE DE TU CÓDIGO DIAMOND
+            // ==============================================
+            
+            // 1. Configurar WebGL State para dibujar SOLO profundidad
+            const gl = renderer.getContext();
+            
+            // Si hay sesión y oclusión activa
+            if (xrGlBinding && occlusionEnabled) {
+                const pose = frame.getViewerPose(xrRefSpace);
+                if (pose) {
+                    // Desactivar escritura de color (R,G,B,A = false)
+                    // Solo queremos escribir en el Z-Buffer
+                    gl.colorMask(false, false, false, false); 
+                    
+                    // Limpiar el depth buffer antes de empezar (opcional si Threejs lo hace, pero seguro aquí)
+                    // gl.clear(gl.DEPTH_BUFFER_BIT); // Threejs autoClear usually handles this
+
+                    let wroteDepth = false;
+
+                    for (const view of pose.views) {
+                        // Obtener info de profundidad del Quest 3
+                        const dInfo = xrGlBinding.getDepthInformation(view);
+                        
+                        if (dInfo) {
+                            wroteDepth = true;
+                            
+                            // Subir textura de profundidad del Quest
+                            gl.bindTexture(gl.TEXTURE_2D, depthTex);
+                            gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE_ALPHA, dInfo.width, dInfo.height, 0, gl.LUMINANCE_ALPHA, gl.UNSIGNED_BYTE, dInfo.data);
+
+                            // Usar tu shader
+                            gl.useProgram(depthProgram);
+                            
+                            // Pasar uniformes (Conversión Raw -> Metros -> Proyección)
+                            gl.uniform1f(gl.getUniformLocation(depthProgram, 'uRawToMeters'), dInfo.rawValueToMeters);
+                            gl.uniformMatrix4fv(gl.getUniformLocation(depthProgram, 'uProj'), false, view.projectionMatrix);
+
+                            // Dibujar el Quad que llena la pantalla
+                            gl.bindVertexArray(depthVao);
+                            gl.drawArrays(gl.TRIANGLES, 0, 6);
+                        }
+                    }
+
+                    // Reactivar escritura de color para que Three.js pueda dibujar las víboras
+                    gl.colorMask(true, true, true, true);
+                }
+            }
+        }
+
+        // 2. Renderizar la escena normal (Three.js)
+        // Como el Z-Buffer ya tiene la profundidad de tus muebles (gracias al paso anterior),
+        // Three.js no dibujará los pixeles de la víbora que estén "detrás" de la profundidad escrita.
+        renderer.render(scene, camera);
+    }
+
+    function onResize() {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+</script>
+</body>
 </html>
