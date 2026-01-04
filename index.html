@@ -1,248 +1,148 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="es">
 <head>
 <meta charset="utf-8">
-<title>MR Room Calibrator + Snakes Demo</title>
+<title>MR Snake Demo – FIX START</title>
 <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
 <style>
-html,body{margin:0;padding:0;overflow:hidden;background:transparent}
+html,body{margin:0;padding:0;overflow:hidden;background:#000}
+#start{
+  position:fixed;
+  inset:0;
+  margin:auto;
+  width:260px;
+  height:70px;
+  font-size:20px;
+  font-weight:900;
+  border:none;
+  border-radius:40px;
+  background:#ffaa00;
+  z-index:10;
+}
+#info{
+  position:fixed;
+  top:20px;
+  left:20px;
+  color:#00eaff;
+  font-weight:900;
+  z-index:10;
+}
 canvas{position:fixed;inset:0}
-#ui{position:fixed;inset:0;pointer-events:none}
-#start{pointer-events:auto;position:absolute;bottom:40px;left:50%;transform:translateX(-50%);
-padding:16px 40px;border-radius:30px;border:none;font-weight:900;background:#ffaa00}
-#mode{position:absolute;top:20px;left:20px;font-weight:900;color:#ffaa00}
 </style>
 </head>
 <body>
-<div id="ui">
-  <button id="start">INICIAR MR</button>
-  <div id="mode">MODO: CALIBRACIÓN</div>
-</div>
+
+<button id="start">INICIAR MR</button>
+<div id="info">ESPERANDO</div>
 
 <script type="importmap">
-{ "imports": {
-  "three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
-  "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
-}}
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js"
+  }
+}
 </script>
 
 <script type="module">
-import * as THREE from 'three';
-import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+import * as THREE from "three";
 
-/* =========================
-   CORE
-========================= */
-let scene,camera,renderer,xrSession,xrRefSpace;
-let xrGlBinding,depthProgram,depthVao,depthTex;
-let mode="calibrate";
-const planes=[];
-const snakes=[];
-const clock=new THREE.Clock();
+/* =======================
+   VARIABLES CORE
+======================= */
+let scene, camera, renderer;
+let xrSession = null;
+let xrRefSpace = null;
+let started = false;
 
-/* =========================
-   SHADERS OCLUSIÓN
-========================= */
-const depthVS=`#version 300 es
-in vec2 aPos;out vec2 vUv;
-void main(){vUv=aPos*.5+.5;gl_Position=vec4(aPos,0,1);}
-`;
-const depthFS=`#version 300 es
-precision highp float;precision highp sampler2D;
-in vec2 vUv;uniform sampler2D uDepth;uniform float uRawToMeters;uniform mat4 uProj;
-out vec4 o;
-float d(vec4 c){return(c.r*255.*256.+c.a*255.);}
-void main(){
-float z=d(texture(uDepth,vUv))*uRawToMeters;
-if(z<=0.)discard;
-float zz=-z;
-float cz=uProj[2][2]*zz+uProj[3][2];
-float cw=uProj[2][3]*zz+uProj[3][3];
-gl_FragDepth=clamp((cz/cw)*.5+.5,0.,1.);
-o=vec4(0);
-}`;
+const info = document.getElementById("info");
+const startBtn = document.getElementById("start");
 
-/* =========================
-   INIT
-========================= */
-init();
-function init(){
-scene=new THREE.Scene();
-camera=new THREE.PerspectiveCamera(70,innerWidth/innerHeight,.01,30);
-scene.add(new THREE.HemisphereLight(0xffffff,0x444444,1.4));
-const d=new THREE.DirectionalLight(0xffffff,1.2);
-d.position.set(2,4,2);scene.add(d);
+/* =======================
+   INIT NORMAL (NO XR)
+======================= */
+scene = new THREE.Scene();
+camera = new THREE.PerspectiveCamera(70, window.innerWidth/window.innerHeight, 0.01, 30);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.3));
 
-renderer=new THREE.WebGLRenderer({alpha:true,antialias:true});
-renderer.xr.enabled=true;
-renderer.setSize(innerWidth,innerHeight);
+renderer = new THREE.WebGLRenderer({ alpha:true, antialias:true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.xr.enabled = true;
 document.body.appendChild(renderer.domElement);
 
-window.addEventListener('resize',()=>{
-camera.aspect=innerWidth/innerHeight;
-camera.updateProjectionMatrix();
-renderer.setSize(innerWidth,innerHeight);
+renderer.setAnimationLoop(() => {
+  renderer.render(scene, camera);
 });
 
-renderer.setAnimationLoop(render);
-document.getElementById('start').onclick=startMR;
-}
+/* =======================
+   BOTÓN MR (FIX CLAVE)
+======================= */
+startBtn.addEventListener("click", async () => {
 
-/* =========================
-   XR START
-========================= */
-async function startMR(){
-xrSession=await navigator.xr.requestSession('immersive-ar',{
-requiredFeatures:['local-floor'],
-optionalFeatures:['dom-overlay','depth-sensing'],
-depthSensing:{usagePreference:['cpu-optimized'],dataFormatPreference:['luminance-alpha']},
-domOverlay:{root:document.body}
+  if (!navigator.xr) {
+    info.textContent = "WebXR NO disponible";
+    return;
+  }
+
+  try {
+    info.textContent = "SOLICITANDO SESIÓN XR...";
+    xrSession = await navigator.xr.requestSession("immersive-ar", {
+      requiredFeatures: ["local-floor"],
+      optionalFeatures: ["dom-overlay"],
+      domOverlay: { root: document.body }
+    });
+
+    xrSession.addEventListener("end", () => {
+      info.textContent = "SESIÓN TERMINADA";
+      startBtn.style.display = "block";
+      started = false;
+    });
+
+    renderer.xr.setSession(xrSession);
+    xrRefSpace = await xrSession.requestReferenceSpace("local-floor");
+
+    startBtn.style.display = "none";
+    started = true;
+    info.textContent = "MR ACTIVO";
+
+    spawnTestSnake();
+
+  } catch (e) {
+    info.textContent = "ERROR XR";
+    console.error(e);
+  }
 });
-renderer.xr.setSession(xrSession);
-xrRefSpace=await xrSession.requestReferenceSpace('local-floor');
-initOcclusion();
-initControllers();
-document.getElementById('start').style.display='none';
+
+/* =======================
+   TEST VISUAL GARANTIZADO
+======================= */
+function spawnTestSnake() {
+  const g = new THREE.Group();
+
+  for (let i = 0; i < 16; i++) {
+    const geo = new THREE.ConeGeometry(0.04, 0.08, 8);
+    geo.rotateX(Math.PI / 2);
+    const mat = new THREE.MeshStandardMaterial({ color: 0xff3333 });
+    const m = new THREE.Mesh(geo, mat);
+    m.position.z = -i * 0.08;
+    g.add(m);
+  }
+
+  camera.getWorldPosition(g.position);
+  g.position.add(new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion));
+
+  scene.add(g);
 }
 
-/* =========================
-   OCLUSIÓN
-========================= */
-function initOcclusion(){
-const gl=renderer.getContext();
-xrGlBinding=new XRWebGLBinding(xrSession,gl);
-
-const vs=gl.createShader(gl.VERTEX_SHADER);
-gl.shaderSource(vs,depthVS);gl.compileShader(vs);
-const fs=gl.createShader(gl.FRAGMENT_SHADER);
-gl.shaderSource(fs,depthFS);gl.compileShader(fs);
-
-depthProgram=gl.createProgram();
-gl.attachShader(depthProgram,vs);
-gl.attachShader(depthProgram,fs);
-gl.linkProgram(depthProgram);
-
-depthVao=gl.createVertexArray();
-gl.bindVertexArray(depthVao);
-const vbo=gl.createBuffer();
-gl.bindBuffer(gl.ARRAY_BUFFER,vbo);
-gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([
--1,-1,1,-1,-1,1,-1,1,1,-1,1,1]),gl.STATIC_DRAW);
-const loc=gl.getAttribLocation(depthProgram,'aPos');
-gl.enableVertexAttribArray(loc);
-gl.vertexAttribPointer(loc,2,gl.FLOAT,false,0,0);
-depthTex=gl.createTexture();
-}
-
-/* =========================
-   CONTROLES / PLANOS
-========================= */
-function initControllers(){
-const factory=new XRControllerModelFactory();
-for(let i=0;i<2;i++){
-const c=renderer.xr.getController(i);
-c.addEventListener('selectstart',()=>onSelect(c));
-c.addEventListener('squeezestart',()=>onSqueeze(c));
-scene.add(c);
-
-const g=renderer.xr.getControllerGrip(i);
-g.add(factory.createControllerModel(g));
-scene.add(g);
-}
-}
-
-function onSelect(c){
-if(mode!=="calibrate")return;
-const p=new THREE.Mesh(
-new THREE.PlaneGeometry(1,1),
-new THREE.MeshStandardMaterial({color:0x00eaff,transparent:true,opacity:.25,side:THREE.DoubleSide})
-);
-p.position.setFromMatrixPosition(c.matrixWorld);
-p.quaternion.copy(c.quaternion);
-scene.add(p);
-planes.push(p);
-}
-
-function onSqueeze(){
-if(mode==="calibrate" && planes.length>=4){
-mode="game";
-document.getElementById('mode').textContent="MODO: JUEGO";
-spawnSnakes();
-}
-}
-
-/* =========================
-   SERPIENTES
-========================= */
-function createSnake(color){
-const g=new THREE.Group();
-const segs=[];
-for(let i=0;i<24;i++){
-const r=THREE.MathUtils.lerp(.05,.02,i/23);
-const geo=new THREE.ConeGeometry(r,r*2,8);
-geo.rotateX(Math.PI/2);
-const m=new THREE.MeshStandardMaterial({color});
-const s=new THREE.Mesh(geo,m);
-s.position.z=-i*.12;
-g.add(s);segs.push(s);
-}
-scene.add(g);
-return{g,segs,t:0,trail:[]};
-}
-
-function spawnSnakes(){
-planes.forEach((p,i)=>{
-const s=createSnake(i%2?0xff3333:0x5d4037);
-s.wall=p;
-s.g.position.copy(p.position).add(new THREE.Vector3(0,0,-.6).applyQuaternion(p.quaternion));
-snakes.push(s);
+/* =======================
+   RESIZE
+======================= */
+window.addEventListener("resize", () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
 });
-}
-
-function updateSnake(s,dt){
-s.t+=dt;
-s.g.position.add(new THREE.Vector3(0,0,dt*.4).applyQuaternion(s.wall.quaternion));
-s.trail.unshift(s.g.position.clone());
-if(s.trail.length>120)s.trail.pop();
-s.segs.forEach((seg,i)=>{
-const p=s.trail[Math.min(i*4,s.trail.length-1)];
-if(!p)return;
-const lp=s.g.worldToLocal(p.clone());
-lp.x+=Math.sin(s.t*3-i*.5)*.08;
-seg.position.copy(lp);
-});
-}
-
-/* =========================
-   RENDER
-========================= */
-function render(t,frame){
-const dt=clock.getDelta();
-
-if(frame && xrGlBinding){
-const pose=frame.getViewerPose(xrRefSpace);
-if(pose){
-const gl=renderer.getContext();
-gl.colorMask(false,false,false,false);
-for(const v of pose.views){
-const d=xrGlBinding.getDepthInformation(v);
-if(!d)continue;
-gl.bindTexture(gl.TEXTURE_2D,depthTex);
-gl.texImage2D(gl.TEXTURE_2D,0,gl.LUMINANCE_ALPHA,d.width,d.height,0,
-gl.LUMINANCE_ALPHA,gl.UNSIGNED_BYTE,d.data);
-gl.useProgram(depthProgram);
-gl.uniform1f(gl.getUniformLocation(depthProgram,'uRawToMeters'),d.rawValueToMeters);
-gl.uniformMatrix4fv(gl.getUniformLocation(depthProgram,'uProj'),false,v.projectionMatrix);
-gl.bindVertexArray(depthVao);
-gl.drawArrays(gl.TRIANGLES,0,6);
-}
-gl.colorMask(true,true,true,true);
-}
-}
-
-if(mode==="game")snakes.forEach(s=>updateSnake(s,dt));
-renderer.render(scene,camera);
-}
 </script>
+
 </body>
 </html>
+
