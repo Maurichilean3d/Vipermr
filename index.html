@@ -1,8 +1,9 @@
+
 <!DOCTYPE html>
 <html lang="es">
 <head>
 <meta charset="utf-8">
-<title>Snake MR – Concept Demo</title>
+<title>Snake MR – Concept Demo (Showcase)</title>
 <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
 <style>
 html,body{margin:0;padding:0;overflow:hidden;background:transparent}
@@ -14,6 +15,19 @@ padding:16px 32px;font-size:18px;font-weight:900;border:none;border-radius:30px;
 #noise{position:absolute;bottom:20px;left:50%;transform:translateX(-50%);
 width:240px;height:18px;border:2px solid #00eaff;border-radius:10px}
 #noiseFill{height:100%;width:0%;background:#00eaff;border-radius:8px}
+#sceneSelector{
+  position:absolute;right:20px;top:20px;
+  display:none;flex-direction:column;gap:8px;
+  pointer-events:auto
+}
+.sceneBtn{
+  padding:10px 14px;
+  font-weight:800;
+  border-radius:10px;
+  border:none;
+  background:#00eaff;
+  color:#000
+}
 #damage{position:fixed;inset:0;background:red;opacity:0;pointer-events:none;transition:.2s}
 </style>
 </head>
@@ -25,6 +39,13 @@ width:240px;height:18px;border:2px solid #00eaff;border-radius:10px}
   <div id="hud">MISSION: CROSS WITHOUT WAKING THEM
 NOISE LEVEL: LOW</div>
   <div id="noise"><div id="noiseFill"></div></div>
+
+  <div id="sceneSelector">
+    <button class="sceneBtn" data-scene="front">PARED FRONTAL</button>
+    <button class="sceneBtn" data-scene="left">PARED IZQUIERDA</button>
+    <button class="sceneBtn" data-scene="right">PARED DERECHA</button>
+    <button class="sceneBtn" data-scene="floor">SUELO</button>
+  </div>
 </div>
 
 <script type="importmap">
@@ -41,16 +62,25 @@ const btn=document.getElementById('btn');
 const hud=document.getElementById('hud');
 const noiseFill=document.getElementById('noiseFill');
 const dmg=document.getElementById('damage');
+const sceneSelector=document.getElementById('sceneSelector');
 
 let noise=0;
 let lastCamPos=new THREE.Vector3();
 let alerted=false;
+let showcaseMode=false;
 
 const sleepingSnakes=[];
 let activeSnake=null;
 
-// ================= INIT =================
+const scenes={
+  front:{cam:new THREE.Vector3(0,1.6,2),look:new THREE.Vector3(0,1.4,-3),wall:new THREE.Vector3(0,1.4,-3),normal:new THREE.Vector3(0,0,1)},
+  left:{cam:new THREE.Vector3(-2.5,1.6,0),look:new THREE.Vector3(-3,1.4,0),wall:new THREE.Vector3(-3,1.4,0),normal:new THREE.Vector3(1,0,0)},
+  right:{cam:new THREE.Vector3(2.5,1.6,0),look:new THREE.Vector3(3,1.4,0),wall:new THREE.Vector3(3,1.4,0),normal:new THREE.Vector3(-1,0,0)},
+  floor:{cam:new THREE.Vector3(0,1.8,2),look:new THREE.Vector3(0,0,0),wall:new THREE.Vector3(0,0,0),normal:new THREE.Vector3(0,1,0)}
+};
+
 init();
+
 function init(){
   scene=new THREE.Scene();
   camera=new THREE.PerspectiveCamera(70,innerWidth/innerHeight,.01,40);
@@ -72,11 +102,10 @@ function init(){
   renderer.setAnimationLoop(render);
 }
 
-// ============= ROOM =====================
 function buildVirtualRoom(){
   const g=new THREE.Group();scene.add(g);
-  const wallMat=new THREE.MeshBasicMaterial({color:0x00ffff,transparent:true,opacity:.08,side:THREE.DoubleSide});
-  const floorMat=new THREE.MeshBasicMaterial({color:0x00ff00,transparent:true,opacity:.08,side:THREE.DoubleSide});
+  const wallMat=new THREE.MeshStandardMaterial({color:0xcccccc,roughness:.9,transparent:true,opacity:.25,side:THREE.DoubleSide});
+  const floorMat=new THREE.MeshStandardMaterial({color:0x999999,roughness:.95,transparent:true,opacity:.2,side:THREE.DoubleSide});
 
   const floor=new THREE.Mesh(new THREE.PlaneGeometry(6,6),floorMat);
   floor.rotation.x=-Math.PI/2;g.add(floor);
@@ -88,22 +117,34 @@ function buildVirtualRoom(){
   wall.position.z=-3;wall.position.y=1.35;g.add(wall);
 }
 
-// ============= MR ======================
 async function startMR(){
   xrSession=await navigator.xr.requestSession('immersive-ar',{requiredFeatures:['local-floor']});
   renderer.xr.setSession(xrSession);
   xrRefSpace=await xrSession.requestReferenceSpace('local-floor');
-
   btn.style.display='none';
+  sceneSelector.style.display='flex';
   spawnSleepingSnakes();
+
+  document.querySelectorAll('.sceneBtn').forEach(b=>{
+    b.onclick=()=>moveCameraToScene(b.dataset.scene);
+  });
 }
 
-// ========== SNAKES =====================
+function moveCameraToScene(name){
+  const s=scenes[name];
+  showcaseMode=true;
+  camera.position.copy(s.cam);
+  camera.lookAt(s.look);
+  noise=0;alerted=false;
+  if(activeSnake){scene.remove(activeSnake.g);activeSnake=null;}
+  spawnWallSnake(s);
+}
+
 function createSnake(color=0xff5533,scale=1){
   const g=new THREE.Group();
   const segs=[];
-  for(let i=0;i<20;i++){
-    const r=THREE.MathUtils.lerp(.05,.02,i/19)*scale;
+  for(let i=0;i<22;i++){
+    const r=THREE.MathUtils.lerp(.05,.02,i/21)*scale;
     const geo=new THREE.CylinderGeometry(r*.8,r,.1,8);
     geo.rotateX(Math.PI/2);
     const m=new THREE.MeshStandardMaterial({color,roughness:.4});
@@ -116,54 +157,58 @@ function createSnake(color=0xff5533,scale=1){
 }
 
 function spawnSleepingSnakes(){
-  for(let i=0;i<12;i++){
+  for(let i=0;i<10;i++){
     const s=createSnake(0xff5533,.8);
     s.g.position.set((Math.random()-0.5)*4,0.05,(Math.random()-0.5)*4);
-    s.sleeping=true;
     sleepingSnakes.push(s);
   }
 }
-// ============ ACTIVE SNAKE ===============
-function spawnWallSnake(){
-  const s=createSnake(0x8d5a2b,1.6);
-  s.wallNormal=new THREE.Vector3(0,0,1);
-  s.wallPos=new THREE.Vector3(0,1.4,-3);
-  s.g.position.copy(s.wallPos).add(s.wallNormal.clone().multiplyScalar(-0.6));
+
+function spawnWallSnake(sceneData){
+  const s=createSnake(0x8d5a2b,1.7);
+  s.wallPos=sceneData.wall.clone();
+  s.wallNormal=sceneData.normal.clone();
+  s.g.position.copy(s.wallPos).add(s.wallNormal.clone().multiplyScalar(-0.8));
   s.phase="emerge";
   activeSnake=s;
+
+  const crack=new THREE.Mesh(
+    new THREE.PlaneGeometry(1.2,1.2),
+    new THREE.MeshBasicMaterial({color:0x000000,transparent:true,opacity:.35})
+  );
+  crack.position.copy(sceneData.wall);
+  scene.add(crack);
+  setTimeout(()=>scene.remove(crack),1200);
 }
 
-// ============ UPDATE =====================
 function updateNoise(dt){
   const camPos=new THREE.Vector3();camera.getWorldPosition(camPos);
-  const speed=camPos.distanceTo(lastCamPos)/dt;
+  const speed=camPos.distanceTo(lastCamPos)/Math.max(dt,0.001);
   lastCamPos.copy(camPos);
-  noise+=speed*0.05;
-  noise=Math.max(0,noise-dt*0.3);
+  noise+=speed*0.03;
+  noise=Math.max(0,noise-dt*0.25);
   noiseFill.style.width=Math.min(100,noise*100)+"%";
   hud.textContent=`MISSION: CROSS WITHOUT WAKING THEM\nNOISE LEVEL: ${noise<.3?"LOW":noise<.7?"MED":"HIGH"}`;
-
-  if(noise>1 && !alerted){
-    alerted=true;
-    spawnWallSnake();
-  }
 }
 
 function updateSnake(s,dt){
   s.t+=dt;
   if(s.phase==="emerge"){
-    s.g.position.addScaledVector(s.wallNormal,dt*0.4);
+    s.g.position.addScaledVector(s.wallNormal,dt*0.25);
     if(s.t>1){s.phase="crawl";s.t=0;}
   }
   else if(s.phase==="crawl"){
-    const x=Math.sin(s.t*.5)*1.6;
-    s.g.position.set(x,1.4,-2.8);
+    const x=Math.sin(s.t*.4)*1.8;
+    if(Math.abs(s.wallNormal.z)>0)
+      s.g.position.set(x,1.4,-2.8);
+    else
+      s.g.position.set(s.wallPos.x,1.4,x);
     if(s.t>4){s.phase="attack";s.t=0;}
   }
   else if(s.phase==="attack"){
     const dir=new THREE.Vector3();camera.getWorldPosition(dir);
     dir.sub(s.g.position).normalize();
-    s.g.position.addScaledVector(dir,dt*1.2);
+    s.g.position.addScaledVector(dir,dt*1.0);
     if(s.t>1.2){s.phase="retreat";s.t=0;}
   }
   else if(s.phase==="retreat"){
@@ -172,10 +217,10 @@ function updateSnake(s,dt){
   }
 
   s.trail.unshift(s.g.position.clone());
-  if(s.trail.length>120)s.trail.pop();
+  if(s.trail.length>140)s.trail.pop();
 
   for(let i=0;i<s.segs.length;i++){
-    const p=s.trail[Math.min(i*4,s.trail.length-1)];
+    const p=s.trail[Math.min(i*5,s.trail.length-1)];
     if(!p)continue;
     const local=s.g.worldToLocal(p.clone());
     local.x+=Math.sin(s.t*3-i*.4)*.06;
@@ -183,11 +228,10 @@ function updateSnake(s,dt){
   }
 }
 
-// ============ RENDER =====================
 function render(){
   const dt=Math.min(.05,clock.getDelta());
   if(xrSession){
-    updateNoise(dt);
+    if(!showcaseMode)updateNoise(dt);
     if(activeSnake)updateSnake(activeSnake,dt);
   }
   renderer.render(scene,camera);
@@ -195,4 +239,3 @@ function render(){
 </script>
 </body>
 </html>
-
