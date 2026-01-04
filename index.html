@@ -1,881 +1,172 @@
-
 <!DOCTYPE html>
 <html lang="es">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
-  <title>Víbora MR (Quest 3) - Passthrough + Oclusión + Paredes + Serpenteo</title>
-  <style>
-    html, body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; background: transparent; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
-    canvas { display:block; background: transparent !important; }
-
-    #overlay { position: fixed; inset: 0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap: 14px; pointer-events:none; z-index: 10; }
-    #btn-ar {
-      pointer-events:auto; padding: 14px 28px; background: #ffaa00; border: none; border-radius: 999px;
-      font-weight: 900; font-size: 18px; color: #000; box-shadow: 0 0 22px rgba(255, 170, 0, 0.55); cursor:pointer;
-    }
-    #hud {
-      pointer-events:none; display:none; position:absolute; top: 16px; left: 16px;
-      color:#ffaa00; font-weight: 900; text-shadow: 0 0 10px rgba(0,0,0,0.85);
-      font-size: 18px; line-height: 1.2; white-space: pre;
-    }
-    #hint {
-      pointer-events:none; display:none; position:absolute; bottom: 16px; left: 50%; transform: translateX(-50%);
-      padding: 10px 14px; border-radius: 12px; background: rgba(0,0,0,0.35);
-      color: rgba(255,255,255,0.9); font-size: 13px;
-    }
-    #damage { position: fixed; inset:0; background: red; opacity: 0; pointer-events:none; transition: opacity 120ms; z-index: 20; }
-  </style>
+<meta charset="utf-8">
+<title>Víbora MR – Room Planes</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<style>
+html,body{margin:0;padding:0;overflow:hidden;background:transparent}
+canvas{background:transparent}
+#ui{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none}
+#btn{pointer-events:auto;padding:16px 32px;font-size:18px;font-weight:900;border:none;border-radius:30px;background:#ffaa00}
+#hud{position:absolute;top:16px;left:16px;color:#ffaa00;font-weight:900;display:none;white-space:pre}
+#damage{position:fixed;inset:0;background:red;opacity:0;pointer-events:none;transition:.15s}
+</style>
 </head>
 <body>
 
 <div id="damage"></div>
-<div id="overlay">
-  <button id="btn-ar">INICIAR MR (Quest 3)</button>
-  <div id="hud">ESQUIVADAS: 0\nNIVEL: 1 (Coralillo)</div>
-  <div id="hint">Tip: muévete lateralmente y agáchate. Si hay planes detectados, saldrá desde paredes reales.</div>
+<div id="ui">
+  <button id="btn">INICIAR MR</button>
+  <div id="hud">ESQUIVADAS: 0</div>
 </div>
 
 <script type="importmap">
-{
-  "imports": {
-    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js"
-  }
-}
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js" } }
 </script>
 
 <script type="module">
 import * as THREE from 'three';
 
-////////////////////////////////////////////////////////////////////////////////
-// 1) DEPTH OCCLUSION SHADERS (solo escriben depth)
-////////////////////////////////////////////////////////////////////////////////
-const depthVS = `#version 300 es
-in vec2 aPos;
-out vec2 vUv;
-void main(){
-  vUv = aPos * 0.5 + 0.5;
-  gl_Position = vec4(aPos, 0.0, 1.0);
-}
-`;
+let scene,camera,renderer,xrSession,xrRefSpace;
+const clock=new THREE.Clock();
+const btn=document.getElementById('btn');
+const hud=document.getElementById('hud');
+const dmg=document.getElementById('damage');
 
-const depthFS = `#version 300 es
-precision highp float;
-precision highp sampler2D;
+const snakes=[];
+const roomPlanes=new Map();
+let score=0,gameOver=false;
 
-in vec2 vUv;
-uniform sampler2D uDepth;
-uniform float uRawToMeters;
-uniform mat4 uProj;
-out vec4 outColor;
-
-// Luminance-Alpha (2 bytes). Lo subimos como RG8 y leemos .rg
-float decodeRG(vec2 rg){
-  float lo = rg.x * 255.0;
-  float hi = rg.y * 255.0;
-  return hi * 256.0 + lo;
-}
-
-void main(){
-  vec2 rg = texture(uDepth, vUv).rg;
-  float raw = decodeRG(rg);
-  float zMeters = raw * uRawToMeters;
-  if(zMeters <= 0.0) discard;
-
-  float z = -zMeters; // cámara OpenGL
-
-  float clipZ = uProj[2][2] * z + uProj[3][2];
-  float clipW = uProj[2][3] * z + uProj[3][3];
-  float ndcZ = clipZ / clipW;
-  float depth = clamp(ndcZ * 0.5 + 0.5, 0.0, 1.0);
-
-  gl_FragDepth = depth;
-  outColor = vec4(0.0);
-}
-`;
-
-////////////////////////////////////////////////////////////////////////////////
-// 2) THREE / XR STATE
-////////////////////////////////////////////////////////////////////////////////
-let camera, scene, renderer;
-let xrSession = null, xrRefSpace = null, xrGlBinding = null;
-let depthProgram = null, depthVao = null, depthTex = null;
-let depthEnabled = true;
-
-let planeDetectionSupported = false;
-
-const btn = document.getElementById('btn-ar');
-const hud = document.getElementById('hud');
-const hint = document.getElementById('hint');
-const dmg = document.getElementById('damage');
-
-const playerPos = new THREE.Vector3();
-
-let roomGroup;
-
-// Juego
-const snakes = [];
-const debris = [];
-const cracks = [];
-let lastSpawn = 0;
-let spawnInterval = 2600;
-let score = 0;
-let level = 1;
-let gameOverFlag = false;
-
-// temporales
-const tmpMat4 = new THREE.Matrix4();
-const tmpQuat = new THREE.Quaternion();
-const tmpPos  = new THREE.Vector3();
+const MAT_WALL=new THREE.MeshBasicMaterial({color:0x00ffff,transparent:true,opacity:.12,side:THREE.DoubleSide,depthWrite:false});
+const MAT_FLOOR=new THREE.MeshBasicMaterial({color:0x00ff00,transparent:true,opacity:.10,side:THREE.DoubleSide,depthWrite:false});
+const MAT_CEIL=new THREE.MeshBasicMaterial({color:0xff00ff,transparent:true,opacity:.10,side:THREE.DoubleSide,depthWrite:false});
 
 init();
 
 function init(){
-  scene = new THREE.Scene();
-  scene.background = null;
+  scene=new THREE.Scene();
+  camera=new THREE.PerspectiveCamera(70,innerWidth/innerHeight,.01,30);
+  scene.add(new THREE.HemisphereLight(0xffffff,0x444444,1.3));
 
-  camera = new THREE.PerspectiveCamera(70, window.innerWidth/window.innerHeight, 0.01, 35);
-
-  const hemi = new THREE.HemisphereLight(0xffffff, 0x404040, 1.2);
-  hemi.position.set(0, 2, 0);
-  scene.add(hemi);
-
-  const dir = new THREE.DirectionalLight(0xffaa55, 1.8);
-  dir.position.set(2, 3, 1);
-  scene.add(dir);
-
-  renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  renderer.setSize(window.innerWidth, window.innerHeight);
-  renderer.xr.enabled = true;
-
-  // PASSTHROUGH: clave
-  renderer.setClearColor(0x000000, 0);
-  scene.background = null;
-
+  renderer=new THREE.WebGLRenderer({alpha:true,antialias:true});
+  renderer.xr.enabled=true;
+  renderer.setClearColor(0x000000,0);
+  renderer.setSize(innerWidth,innerHeight);
   document.body.appendChild(renderer.domElement);
 
-  buildVirtualRoom();
-
-  btn.addEventListener('click', startMR);
-  window.addEventListener('resize', onResize);
-
+  btn.onclick=startMR;
+  addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight)});
   renderer.setAnimationLoop(render);
 }
 
-function onResize(){
-  camera.aspect = window.innerWidth/window.innerHeight;
-  camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
-}
-
-function buildVirtualRoom(){
-  roomGroup = new THREE.Group();
-  scene.add(roomGroup);
-
-  const matFloor = new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.95 });
-  const matCeil  = new THREE.MeshStandardMaterial({ color: 0x0b0b0b, roughness: 0.95 });
-  const matWall  = new THREE.MeshStandardMaterial({ color: 0x141414, roughness: 0.95, transparent:true, opacity: 0.18 });
-
-  const W = 6.0, H = 2.8, D = 6.0;
-
-  const floor = new THREE.Mesh(new THREE.PlaneGeometry(W, D), matFloor);
-  floor.rotation.x = -Math.PI/2;
-  floor.position.y = 0;
-  roomGroup.add(floor);
-
-  const ceil = new THREE.Mesh(new THREE.PlaneGeometry(W, D), matCeil);
-  ceil.rotation.x = Math.PI/2;
-  ceil.position.y = H;
-  roomGroup.add(ceil);
-
-  const wallGeo = new THREE.PlaneGeometry(W, H);
-
-  const wallN = new THREE.Mesh(wallGeo, matWall);
-  wallN.position.set(0, H/2, -D/2);
-  roomGroup.add(wallN);
-
-  const wallS = new THREE.Mesh(wallGeo, matWall);
-  wallS.rotation.y = Math.PI;
-  wallS.position.set(0, H/2, D/2);
-  roomGroup.add(wallS);
-
-  const wallE = new THREE.Mesh(new THREE.PlaneGeometry(D, H), matWall);
-  wallE.rotation.y = -Math.PI/2;
-  wallE.position.set(W/2, H/2, 0);
-  roomGroup.add(wallE);
-
-  const wallW = new THREE.Mesh(new THREE.PlaneGeometry(D, H), matWall);
-  wallW.rotation.y = Math.PI/2;
-  wallW.position.set(-W/2, H/2, 0);
-  roomGroup.add(wallW);
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// 3) START MR
-////////////////////////////////////////////////////////////////////////////////
 async function startMR(){
-  if(!navigator.xr){ alert("WebXR no disponible"); return; }
-
-  const supported = await navigator.xr.isSessionSupported('immersive-ar');
-  if(!supported){ alert("immersive-ar no soportado aquí"); return; }
-
-  const sessionInit = {
-    requiredFeatures: ['local-floor'],
-    optionalFeatures: ['dom-overlay', 'depth-sensing', 'plane-detection'],
-    domOverlay: { root: document.body },
-    depthSensing: {
-      usagePreference: ['cpu-optimized'],
-      dataFormatPreference: ['luminance-alpha']
-    }
-  };
-
-  try{
-    xrSession = await navigator.xr.requestSession('immersive-ar', sessionInit);
-    renderer.xr.setSession(xrSession);
-
-    xrSession.addEventListener('end', () => {
-      xrSession = null; xrRefSpace = null; xrGlBinding = null;
-      hud.style.display = 'none';
-      hint.style.display = 'none';
-      btn.style.display = 'block';
-      resetGame();
-    });
-
-    xrRefSpace = await xrSession.requestReferenceSpace('local-floor');
-
-    // plane detection flag
-    planeDetectionSupported = !!xrSession.detectedPlanes;
-
-    initDepthOcclusion(xrSession);
-
-    btn.style.display = 'none';
-    hud.style.display = 'block';
-    hint.style.display = 'block';
-
-    resetGame();
-  }catch(e){
-    console.error(e);
-    alert("Error iniciando MR: " + e.message);
-  }
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// 4) DEPTH OCCLUSION INIT
-////////////////////////////////////////////////////////////////////////////////
-function initDepthOcclusion(session){
-  const gl = renderer.getContext();
-  xrGlBinding = new XRWebGLBinding(session, gl);
-
-  const vs = gl.createShader(gl.VERTEX_SHADER);
-  gl.shaderSource(vs, depthVS);
-  gl.compileShader(vs);
-  if(!gl.getShaderParameter(vs, gl.COMPILE_STATUS)){
-    console.error("Depth VS:", gl.getShaderInfoLog(vs));
-  }
-
-  const fs = gl.createShader(gl.FRAGMENT_SHADER);
-  gl.shaderSource(fs, depthFS);
-  gl.compileShader(fs);
-  if(!gl.getShaderParameter(fs, gl.COMPILE_STATUS)){
-    console.error("Depth FS:", gl.getShaderInfoLog(fs));
-  }
-
-  depthProgram = gl.createProgram();
-  gl.attachShader(depthProgram, vs);
-  gl.attachShader(depthProgram, fs);
-  gl.linkProgram(depthProgram);
-  if(!gl.getProgramParameter(depthProgram, gl.LINK_STATUS)){
-    console.error("Depth link:", gl.getProgramInfoLog(depthProgram));
-  }
-
-  depthVao = gl.createVertexArray();
-  gl.bindVertexArray(depthVao);
-
-  const vbo = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
-  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
-    -1,-1,  1,-1, -1, 1,
-    -1, 1,  1,-1,  1, 1
-  ]), gl.STATIC_DRAW);
-
-  const loc = gl.getAttribLocation(depthProgram, 'aPos');
-  gl.enableVertexAttribArray(loc);
-  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
-
-  depthTex = gl.createTexture();
-  gl.bindTexture(gl.TEXTURE_2D, depthTex);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// 5) GAME UI / LEVELS
-////////////////////////////////////////////////////////////////////////////////
-function resetGame(){
-  score = 0;
-  level = 1;
-  spawnInterval = 2600;
-  lastSpawn = 0;
-  gameOverFlag = false;
-
-  for(const s of snakes) scene.remove(s.group);
-  snakes.length = 0;
-
-  for(const d of debris) scene.remove(d.mesh);
-  debris.length = 0;
-
-  for(const c of cracks) scene.remove(c.mesh);
-  cracks.length = 0;
-
-  updateHud();
-}
-
-function updateHud(){
-  const name =
-    level === 1 ? "Coralillo" :
-    level === 2 ? "Cascabel" :
-    level === 3 ? "Mamba" :
-    "Boa (Jefe)";
-  hud.textContent = `ESQUIVADAS: ${score}\nNIVEL: ${level} (${name})`;
-}
-
-function computeLevelFromScore(sc){
-  if(sc < 7) return 1;
-  if(sc < 15) return 2;
-  if(sc < 25) return 3;
-  return 4;
-}
-
-function getSnakeConfig(lvl){
-  if(lvl === 1) return {
-    speedWall: 1.35, speedLunge: 5.0,
-    scale: 0.8,
-    segments: 18, segLen: 0.09, rHead: 0.035, rTail: 0.015,
-    colorBody: 0xff2a2a, colorHead: 0x111111,
-    damageRadius: 0.28,
-    waveAmp: 0.055, waveFreq: 9.0
-  };
-  if(lvl === 2) return {
-    speedWall: 1.55, speedLunge: 5.4,
-    scale: 0.9,
-    segments: 20, segLen: 0.095, rHead: 0.040, rTail: 0.017,
-    colorBody: 0xc2a22a, colorHead: 0x3b2a16,
-    damageRadius: 0.30,
-    waveAmp: 0.060, waveFreq: 8.2
-  };
-  if(lvl === 3) return {
-    speedWall: 1.75, speedLunge: 5.8,
-    scale: 1.0,
-    segments: 22, segLen: 0.10, rHead: 0.043, rTail: 0.019,
-    colorBody: 0x1fd16a, colorHead: 0x0a2b14,
-    damageRadius: 0.32,
-    waveAmp: 0.065, waveFreq: 7.6
-  };
-  return {
-    speedWall: 1.15, speedLunge: 4.0,
-    scale: 1.6,
-    segments: 28, segLen: 0.11, rHead: 0.060, rTail: 0.030,
-    colorBody: 0x5d4037, colorHead: 0x2e7d32,
-    damageRadius: 0.42,
-    waveAmp: 0.050, waveFreq: 6.2
-  };
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// 6) FX: CRACK + DEBRIS
-////////////////////////////////////////////////////////////////////////////////
-function spawnCrack(worldPos, worldQuat){
-  const geo = new THREE.PlaneGeometry(0.55, 0.55);
-  const mat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent:true, opacity: 0.0, depthWrite:false });
-  const mesh = new THREE.Mesh(geo, mat);
-  mesh.position.copy(worldPos);
-  mesh.quaternion.copy(worldQuat);
-
-  const forward = new THREE.Vector3(0,0,1).applyQuaternion(worldQuat);
-  mesh.position.add(forward.multiplyScalar(0.01));
-  mesh.renderOrder = 999;
-
-  // textura rápida con canvas
-  const canvas = document.createElement('canvas');
-  canvas.width = 256; canvas.height = 256;
-  const ctx = canvas.getContext('2d');
-  ctx.clearRect(0,0,256,256);
-  ctx.fillStyle = 'rgba(255,255,255,0.28)';
-  ctx.fillRect(0,0,256,256);
-  ctx.strokeStyle = 'rgba(0,0,0,0.85)';
-  ctx.lineWidth = 3;
-
-  function crackLine(x,y,len,ang,depth){
-    if(depth<=0) return;
-    const x2 = x + Math.cos(ang)*len;
-    const y2 = y + Math.sin(ang)*len;
-    ctx.beginPath(); ctx.moveTo(x,y); ctx.lineTo(x2,y2); ctx.stroke();
-    const branches = 1 + Math.floor(Math.random()*3);
-    for(let i=0;i<branches;i++){
-      const a2 = ang + (Math.random()-0.5)*1.2;
-      crackLine(x2,y2,len*(0.45+Math.random()*0.35),a2,depth-1);
-    }
-  }
-  for(let i=0;i<6;i++){
-    crackLine(128,128,60+Math.random()*40,Math.random()*Math.PI*2,3);
-  }
-
-  const tex = new THREE.CanvasTexture(canvas);
-  tex.minFilter = THREE.LinearFilter;
-  tex.magFilter = THREE.LinearFilter;
-  mat.map = tex;
-  mat.needsUpdate = true;
-
-  scene.add(mesh);
-  cracks.push({ mesh, t: 0 });
-}
-
-function spawnDebris(worldPos, worldQuat, intensity=1.0){
-  const count = Math.floor(10 * intensity);
-  for(let i=0;i<count;i++){
-    const geo = new THREE.BoxGeometry(0.035,0.035,0.035);
-    const mat = new THREE.MeshStandardMaterial({ color: 0x666666, roughness: 1.0 });
-    const m = new THREE.Mesh(geo, mat);
-    m.position.copy(worldPos);
-    m.position.x += (Math.random()-0.5)*0.25;
-    m.position.y += (Math.random()-0.5)*0.25;
-    m.position.z += (Math.random()-0.5)*0.25;
-
-    const outward = new THREE.Vector3(0,0,1).applyQuaternion(worldQuat).normalize();
-    const v = outward.multiplyScalar(1.8 + Math.random()*2.4);
-    v.add(new THREE.Vector3((Math.random()-0.5)*1.2, (Math.random()-0.2)*1.5, (Math.random()-0.5)*1.2));
-
-    scene.add(m);
-    debris.push({ mesh: m, vel: v, life: 0.9 + Math.random()*0.4 });
-  }
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// 7) SNAKE MODEL: segmentos cónicos + seguimiento + serpenteo
-////////////////////////////////////////////////////////////////////////////////
-function makeConeSegment(r1, r2, len, color){
-  const geo = new THREE.CylinderGeometry(r2, r1, len, 10, 1, false);
-  geo.rotateX(Math.PI/2); // hacia +Z
-  const mat = new THREE.MeshStandardMaterial({ color, roughness: 0.45, metalness: 0.0 });
-  return new THREE.Mesh(geo, mat);
-}
-
-function createSegmentSnake(cfg){
-  const group = new THREE.Group();
-  const segments = [];
-  const segLen = cfg.segLen * cfg.scale;
-
-  for(let i=0;i<cfg.segments;i++){
-    const t = i / (cfg.segments - 1);
-    const rHead = cfg.rHead * cfg.scale;
-    const rTail = cfg.rTail * cfg.scale;
-    const r1 = THREE.MathUtils.lerp(rHead, rTail, t);
-    const r2 = THREE.MathUtils.lerp(rHead*0.85, rTail*0.7, t);
-    const seg = makeConeSegment(r1, r2, segLen, cfg.colorBody);
-    seg.position.z = -i * segLen;
-    group.add(seg);
-    segments.push(seg);
-  }
-
-  const headGeo = new THREE.ConeGeometry(cfg.rHead * 1.35 * cfg.scale, segLen * 1.1, 12);
-  headGeo.rotateX(Math.PI/2);
-  const headMat = new THREE.MeshStandardMaterial({ color: cfg.colorHead, roughness: 0.35 });
-  const head = new THREE.Mesh(headGeo, headMat);
-  head.position.z = 0.03 * cfg.scale;
-  group.add(head);
-
-  return { group, segments, head, segLen };
-}
-
-function doGameOver(){
-  if(gameOverFlag) return;
-  gameOverFlag = true;
-
-  dmg.style.opacity = 0.75;
-  setTimeout(()=> dmg.style.opacity = 0.0, 180);
-
-  hud.textContent = `¡MORDIDO!\nReiniciando...`;
-  setTimeout(() => resetGame(), 1400);
-}
-////////////////////////////////////////////////////////////////////////////////
-// 8) SPAWN: elegir pared real (plane-detection) o fallback circular
-////////////////////////////////////////////////////////////////////////////////
-function pickWallSpawn(frame){
-  // Actualiza playerPos (por si aún no se calculó en este frame)
-  camera.getWorldPosition(playerPos);
-
-  if(planeDetectionSupported && xrSession?.detectedPlanes && frame){
-    const planes = Array.from(xrSession.detectedPlanes);
-    if(planes.length){
-      for(let tries=0; tries<12; tries++){
-        const p = planes[(Math.random() * planes.length) | 0];
-        const pose = frame.getPose(p.planeSpace, xrRefSpace);
-        if(!pose) continue;
-
-        tmpMat4.fromArray(pose.transform.matrix);
-        tmpQuat.setFromRotationMatrix(tmpMat4);
-        tmpPos.setFromMatrixPosition(tmpMat4);
-
-        // Heurística pared: "up" del plano NO alineado al Y mundo
-        const upWorld = new THREE.Vector3(0,1,0).applyQuaternion(tmpQuat).normalize();
-        const dot = Math.abs(upWorld.dot(new THREE.Vector3(0,1,0)));
-        const looksLikeWall = dot < 0.55;
-        if(!looksLikeWall) continue;
-
-        const planeQuat = tmpQuat.clone();
-        const planePos  = tmpPos.clone();
-
-        const normal = new THREE.Vector3(0,0,1).applyQuaternion(planeQuat).normalize(); // outward
-        const right  = new THREE.Vector3(1,0,0).applyQuaternion(planeQuat).normalize();
-        const upAxis = new THREE.Vector3(0,1,0).applyQuaternion(planeQuat).normalize();
-
-        const spawnPos = planePos.clone().add(normal.clone().multiplyScalar(0.03));
-
-        const lookM = new THREE.Matrix4().lookAt(spawnPos, playerPos, new THREE.Vector3(0,1,0));
-        const lookQuat = new THREE.Quaternion().setFromRotationMatrix(lookM);
-
-        return { spawnPos, lookQuat, crackQuat: planeQuat, planePos, normal, right, upAxis, isRealPlane: true };
-      }
-    }
-  }
-
-  // Fallback: "pared imaginaria" a un radio
-  const angle = Math.random() * Math.PI * 2;
-  const radius = 2.4;
-  const height = 0.65 + Math.random() * 1.35;
-
-  const spawnPos = new THREE.Vector3(Math.cos(angle)*radius, height, Math.sin(angle)*radius);
-
-  const lookM = new THREE.Matrix4().lookAt(spawnPos, playerPos, new THREE.Vector3(0,1,0));
-  const lookQuat = new THREE.Quaternion().setFromRotationMatrix(lookM);
-
-  const normal = new THREE.Vector3().subVectors(playerPos, spawnPos).normalize();
-  const right  = new THREE.Vector3().crossVectors(new THREE.Vector3(0,1,0), normal).normalize();
-  const upAxis = new THREE.Vector3().crossVectors(normal, right).normalize();
-
-  return { spawnPos, lookQuat, crackQuat: lookQuat, planePos: spawnPos.clone(), normal, right, upAxis, isRealPlane: false };
-}
-
-function spawnSnake(frame){
-  if(!xrSession || gameOverFlag) return;
-
-  level = computeLevelFromScore(score);
-  const cfg = getSnakeConfig(level);
-
-  const info = pickWallSpawn(frame);
-  const { spawnPos, crackQuat, planePos, normal, right, upAxis } = info;
-
-  // FX pared
-  spawnCrack(spawnPos, crackQuat);
-  spawnDebris(spawnPos, crackQuat, level === 4 ? 1.8 : 1.0);
-
-  // Rig segmentado
-  const rig = createSegmentSnake(cfg);
-  const snakeGroup = rig.group;
-
-  // head start
-  snakeGroup.position.copy(spawnPos);
-  snakeGroup.quaternion.copy(info.lookQuat);
-
-  // empieza metida y sale
-  snakeGroup.position.add(normal.clone().multiplyScalar(-0.35));
-
-  scene.add(snakeGroup);
-
-  // Estado
-  snakes.push({
-    group: snakeGroup,
-    rig,
-    cfg,
-
-    planePos: planePos.clone(),
-    normal: normal.clone(),
-    right: right.clone(),
-    upAxis: upAxis.clone(),
-
-    phase: "emerge", // emerge -> wall -> lunge -> return -> sink
-    t: 0,
-    headPos: snakeGroup.position.clone(),
-
-    uv: new THREE.Vector2(0, 0),
-    uvTarget: new THREE.Vector2(
-      (Math.random()*2 - 1) * 1.6,
-      0.3 + Math.random() * 2.0
-    ),
-    trail: []
+  xrSession=await navigator.xr.requestSession('immersive-ar',{
+    requiredFeatures:['local-floor'],
+    optionalFeatures:['plane-detection','dom-overlay'],
+    domOverlay:{root:document.body}
   });
+  renderer.xr.setSession(xrSession);
+  xrRefSpace=await xrSession.requestReferenceSpace('local-floor');
+  btn.style.display='none';
+  hud.style.display='block';
+  score=0;gameOver=false;
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// 9) UPDATE GAME
-////////////////////////////////////////////////////////////////////////////////
-function update(delta, now, frame){
-  if(!xrSession) return;
-
-  // player pos
-  camera.getWorldPosition(playerPos);
-
-  // dificultad
-  level = computeLevelFromScore(score);
-  const base = (level === 4) ? 1200 : 2400;
-  spawnInterval = Math.max(650, base - score * 55);
-
-  // spawn
-  if(!gameOverFlag && (now - lastSpawn) > spawnInterval){
-    const extra = (level >= 3 && Math.random() < 0.35) ? 1 : 0;
-    spawnSnake(frame);
-    if(extra) setTimeout(() => spawnSnake(frame), 180);
-    lastSpawn = now;
-    updateHud();
-  }
-
-  // cracks fade
-  for(let i=cracks.length-1;i>=0;i--){
-    const c = cracks[i];
-    c.t += delta;
-    const aIn = Math.min(1, c.t / 0.12);
-    const aOut = c.t > 0.35 ? Math.max(0, 1 - (c.t - 0.35) / 0.35) : 1;
-    c.mesh.material.opacity = 0.85 * aIn * aOut;
-    c.mesh.scale.setScalar(1 + 0.35 * Math.min(1, c.t / 0.25));
-    if(c.t > 0.75){
-      scene.remove(c.mesh);
-      cracks.splice(i,1);
+function updateRoomPlanes(frame){
+  if(!xrSession?.detectedPlanes)return;
+  for(const [p,e] of roomPlanes){ if(!xrSession.detectedPlanes.has(p)){scene.remove(e.mesh);roomPlanes.delete(p);} }
+  for(const p of xrSession.detectedPlanes){
+    let e=roomPlanes.get(p);
+    if(!e){
+      e={mesh:new THREE.Mesh(new THREE.PlaneGeometry(1,1),MAT_WALL),right:new THREE.Vector3(),up:new THREE.Vector3(),normal:new THREE.Vector3()};
+      scene.add(e.mesh);roomPlanes.set(p,e);
     }
+    const pose=frame.getPose(p.planeSpace,xrRefSpace); if(!pose)continue;
+    const m=new THREE.Matrix4().fromArray(pose.transform.matrix);
+    e.mesh.position.setFromMatrixPosition(m);
+    e.mesh.quaternion.setFromRotationMatrix(m);
+    e.right.set(1,0,0).applyQuaternion(e.mesh.quaternion);
+    e.up.set(0,1,0).applyQuaternion(e.mesh.quaternion);
+    e.normal.set(0,0,1).applyQuaternion(e.mesh.quaternion);
+    const dot=Math.abs(e.up.dot(new THREE.Vector3(0,1,0)));
+    e.mesh.material = dot>.85 ? (e.mesh.position.y>1.8?MAT_CEIL:MAT_FLOOR) : MAT_WALL;
+    e.mesh.geometry.dispose();
+    e.mesh.geometry=new THREE.PlaneGeometry(4, dot>.85?4:2.6);
   }
+}
 
-  // debris
-  for(let i=debris.length-1;i>=0;i--){
-    const d = debris[i];
-    d.life -= delta;
-    d.vel.y -= 2.2 * delta;
-    d.mesh.position.addScaledVector(d.vel, delta);
-    d.mesh.rotation.x += 5*delta;
-    d.mesh.rotation.y += 4*delta;
-    if(d.life <= 0){
-      scene.remove(d.mesh);
-      debris.splice(i,1);
-    }
+function createSnake(){
+  const g=new THREE.Group();
+  const segs=[];
+  for(let i=0;i<18;i++){
+    const r=THREE.MathUtils.lerp(.04,.015,i/17);
+    const geo=new THREE.CylinderGeometry(r*.8,r,.09,10);
+    geo.rotateX(Math.PI/2);
+    const m=new THREE.MeshStandardMaterial({color:0xff3333,roughness:.4});
+    const s=new THREE.Mesh(geo,m);
+    s.position.z=-i*.09;
+    g.add(s);segs.push(s);
   }
+  const head=new THREE.Mesh(new THREE.ConeGeometry(.06,.12,12).rotateX(Math.PI/2),new THREE.MeshStandardMaterial({color:0x111111}));
+  g.add(head);
+  scene.add(g);
+  return {g,segs,trail:[],t:0};
+}
 
-  // snakes
+function spawnSnake(){
+  const walls=[...roomPlanes.values()].filter(e=>e.mesh.material===MAT_WALL);
+  if(!walls.length)return;
+  const w=walls[Math.random()*walls.length|0];
+  const u=(Math.random()*2-1)*1.8;
+  const v=Math.random()*2.2;
+  const pos=w.mesh.position.clone().add(w.right.clone().multiplyScalar(u)).add(w.up.clone().multiplyScalar(v));
+  const s=createSnake();
+  s.wall=w;
+  s.pos=pos.clone().add(w.normal.clone().multiplyScalar(-.3));
+  s.g.position.copy(s.pos);
+  snakes.push(s);
+}
+
+function updateSnakes(dt){
+  const player=new THREE.Vector3();camera.getWorldPosition(player);
   for(let i=snakes.length-1;i>=0;i--){
-    const s = snakes[i];
-    const cfg = s.cfg;
-    s.t += delta;
-
-    // helper: punto en pared desde uv
-    const wallPointFromUV = (uv) => {
-      // Rangos aproximados para "ocupar la habitación"
-      // (si plane polygon está disponible en tu navegador, aquí se puede mapear exacto)
-      const u = THREE.MathUtils.clamp(uv.x, -2.2, 2.2);
-      const v = THREE.MathUtils.clamp(uv.y,  0.2, 2.4);
-
-      return s.planePos.clone()
-        .add(s.right.clone().multiplyScalar(u))
-        .add(s.upAxis.clone().multiplyScalar(v))
-        .add(s.normal.clone().multiplyScalar(0.03));
-    };
-
-    // PHASES
-    if(s.phase === "emerge"){
-      s.headPos.addScaledVector(s.normal, delta * (2.6 + cfg.speedWall * 1.2));
-      if(s.t > 0.18){
-        s.phase = "wall";
-        s.t = 0;
-        s.headPos.copy(wallPointFromUV(s.uv));
-      }
+    const s=snakes[i];s.t+=dt;
+    if(s.t<.6)s.pos.addScaledVector(s.wall.normal,dt*.6);
+    else{
+      const u=Math.sin(s.t*.5)*1.6;
+      const v=.5+Math.sin(s.t*.3)*1.1;
+      s.pos=s.wall.mesh.position.clone().add(s.wall.right.clone().multiplyScalar(u)).add(s.wall.up.clone().multiplyScalar(v));
     }
-    else if(s.phase === "wall"){
-      const dirUV = new THREE.Vector2().subVectors(s.uvTarget, s.uv);
-      const distUV = dirUV.length();
-
-      if(distUV < 0.15){
-        s.uvTarget.set(
-          (Math.random()*2 - 1) * 2.0,
-          0.3 + Math.random() * 2.2
-        );
-
-        const attackChance = (level >= 2 ? 0.22 : 0.12);
-        if(Math.random() < attackChance){
-          s.phase = "lunge";
-          s.t = 0;
-        }
-      } else {
-        dirUV.normalize();
-        s.uv.addScaledVector(dirUV, cfg.speedWall * delta);
-      }
-
-      s.headPos.copy(wallPointFromUV(s.uv));
+    s.trail.unshift(s.pos.clone());
+    if(s.trail.length>80)s.trail.pop();
+    s.g.position.copy(s.pos);
+    for(let j=0;j<s.segs.length;j++){
+      const p=s.trail[Math.min(j*4,s.trail.length-1)];
+      if(!p)continue;
+      const local=s.g.worldToLocal(p.clone());
+      local.x+=Math.sin(s.t*6-j*.5)*.04;
+      s.segs[j].position.copy(local);
     }
-    else if(s.phase === "lunge"){
-      const toPlayer = new THREE.Vector3().subVectors(playerPos, s.headPos).normalize();
-      s.headPos.addScaledVector(toPlayer, cfg.speedLunge * delta);
-
-      if(s.t > 0.55 || s.headPos.distanceTo(playerPos) < 0.65){
-        s.phase = "return";
-        s.t = 0;
-      }
+    if(s.pos.distanceTo(player)<.35&&!gameOver){
+      gameOver=true;
+      dmg.style.opacity=.7;
+      setTimeout(()=>dmg.style.opacity=0,200);
     }
-    else if(s.phase === "return"){
-      const target = wallPointFromUV(s.uv);
-      const toWall = new THREE.Vector3().subVectors(target, s.headPos);
-      const d = toWall.length();
-      if(d < 0.08){
-        s.phase = "sink";
-        s.t = 0;
-      } else {
-        toWall.normalize();
-        s.headPos.addScaledVector(toWall, (cfg.speedWall * 2.0) * delta);
-      }
-    }
-    else if(s.phase === "sink"){
-      s.headPos.addScaledVector(s.normal, -delta * 2.5);
-      if(s.t > 0.35){
-        scene.remove(s.group);
-        snakes.splice(i,1);
-        score++;
-        updateHud();
-        continue;
-      }
-    }
-
-    // COLISIÓN (mordida)
-    if(!gameOverFlag){
-      const dist = s.headPos.distanceTo(playerPos);
-      if(dist < cfg.damageRadius){
-        doGameOver();
-        return;
-      }
-    }
-
-    // TRAIL
-    s.trail.unshift(s.headPos.clone());
-    const maxTrail = cfg.segments * 6;
-    if(s.trail.length > maxTrail) s.trail.length = maxTrail;
-
-    // Pose del grupo en cabeza
-    s.group.position.copy(s.headPos);
-
-    // Dirección base (para orientar)
-    let forward = new THREE.Vector3(0,0,1);
-    if(s.trail.length > 2){
-      forward = new THREE.Vector3().subVectors(s.trail[0], s.trail[2]).normalize();
-      if(forward.lengthSq() < 1e-6) forward.set(0,0,1);
-    }
-
-    const qLook = new THREE.Quaternion().setFromRotationMatrix(
-      new THREE.Matrix4().lookAt(s.headPos, s.headPos.clone().add(forward), new THREE.Vector3(0,1,0))
-    );
-    s.group.quaternion.slerp(qLook, 0.25);
-
-    // serpenteo (onda lateral en frame local)
-    const lateral = new THREE.Vector3(1,0,0).applyQuaternion(s.group.quaternion).normalize();
-    const waveBase = cfg.waveAmp * (s.phase === "wall" ? 1.0 : 0.85);
-
-    // segmentos
-    for(let si=0; si<s.rig.segments.length; si++){
-      const seg = s.rig.segments[si];
-      const idx = Math.min(s.trail.length - 1, si * 5);
-
-      const p = (s.trail[idx] ? s.trail[idx].clone() : s.headPos.clone());
-      const ph = (now * 0.001 * cfg.waveFreq) - (si * 0.55);
-      const off = Math.sin(ph) * waveBase * (1.0 - si / s.rig.segments.length);
-      p.addScaledVector(lateral, off);
-
-      const local = s.group.worldToLocal(p.clone());
-      seg.position.copy(local);
-
-      // orientar cada segmento hacia el anterior
-      if(si > 0){
-        const prev = s.rig.segments[si-1].position;
-        const dir = new THREE.Vector3().subVectors(prev, seg.position);
-        if(dir.lengthSq() > 1e-6){
-          const q = new THREE.Quaternion().setFromRotationMatrix(
-            new THREE.Matrix4().lookAt(seg.position, prev, new THREE.Vector3(0,1,0))
-          );
-          seg.quaternion.slerp(q, 0.35);
-        }
-      }
-    }
+    if(s.t>8){scene.remove(s.g);snakes.splice(i,1);score++;hud.textContent=`ESQUIVADAS: ${score}`;}
   }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// 10) RENDER: depth pass + render normal
-////////////////////////////////////////////////////////////////////////////////
-function render(time, frame){
-  const now = performance.now();
-  const delta = 0.016; // estable
-
-  if(frame) update(delta, now, frame);
-
-  // Depth occlusion pass
-  if(frame && xrSession && depthEnabled && xrGlBinding && depthProgram){
-    const gl = renderer.getContext();
-    const pose = frame.getViewerPose(xrRefSpace);
-    const glLayer = xrSession.renderState.baseLayer;
-
-    if(pose && glLayer){
-      gl.bindFramebuffer(gl.FRAMEBUFFER, glLayer.framebuffer);
-      gl.useProgram(depthProgram);
-
-      const uDepthLoc = gl.getUniformLocation(depthProgram, 'uDepth');
-      const uRawLoc   = gl.getUniformLocation(depthProgram, 'uRawToMeters');
-      const uProjLoc  = gl.getUniformLocation(depthProgram, 'uProj');
-
-      gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, depthTex);
-      gl.uniform1i(uDepthLoc, 0);
-
-      gl.bindVertexArray(depthVao);
-
-      gl.colorMask(false,false,false,false);
-      gl.disable(gl.BLEND);
-      gl.enable(gl.DEPTH_TEST);
-      gl.depthMask(true);
-
-      for(const view of pose.views){
-        const vp = glLayer.getViewport(view);
-        gl.viewport(vp.x, vp.y, vp.width, vp.height);
-
-        let dInfo = null;
-        try { if(frame.getDepthInformation) dInfo = frame.getDepthInformation(view); } catch(e) {}
-        if(!dInfo){
-          try { dInfo = xrGlBinding.getDepthInformation(view); } catch(e) {}
-        }
-        if(!dInfo || !dInfo.data) continue;
-
-        gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-        gl.bindTexture(gl.TEXTURE_2D, depthTex);
-        gl.texImage2D(
-          gl.TEXTURE_2D,
-          0,
-          gl.RG8,
-          dInfo.width,
-          dInfo.height,
-          0,
-          gl.RG,
-          gl.UNSIGNED_BYTE,
-          dInfo.data
-        );
-
-        gl.uniform1f(uRawLoc, dInfo.rawValueToMeters);
-        gl.uniformMatrix4fv(uProjLoc, false, view.projectionMatrix);
-
-        gl.drawArrays(gl.TRIANGLES, 0, 6);
-      }
-
-      gl.colorMask(true,true,true,true);
-    }
+function render(t,frame){
+  const dt=Math.min(.05,clock.getDelta());
+  if(frame){
+    updateRoomPlanes(frame);
+    if(Math.random()<.01)spawnSnake();
+    updateSnakes(dt);
   }
-
-  renderer.render(scene, camera);
+  renderer.render(scene,camera);
 }
-
-// listo
 </script>
 </body>
 </html>
+
