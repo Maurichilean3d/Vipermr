@@ -2,23 +2,29 @@
 <html lang="es">
 <head>
 <meta charset="utf-8">
-<title>Víbora MR – Room Planes</title>
-<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Snake MR – Concept Demo</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
 <style>
 html,body{margin:0;padding:0;overflow:hidden;background:transparent}
 canvas{background:transparent}
-#ui{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none}
-#btn{pointer-events:auto;padding:16px 32px;font-size:18px;font-weight:900;border:none;border-radius:30px;background:#ffaa00}
-#hud{position:absolute;top:16px;left:16px;color:#ffaa00;font-weight:900;display:none;white-space:pre}
-#damage{position:fixed;inset:0;background:red;opacity:0;pointer-events:none;transition:.15s}
+#ui{position:fixed;inset:0;pointer-events:none}
+#btn{pointer-events:auto;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+padding:16px 32px;font-size:18px;font-weight:900;border:none;border-radius:30px;background:#ffaa00}
+#hud{position:absolute;top:20px;left:20px;color:#00eaff;font-weight:900;font-size:18px;white-space:pre}
+#noise{position:absolute;bottom:20px;left:50%;transform:translateX(-50%);
+width:240px;height:18px;border:2px solid #00eaff;border-radius:10px}
+#noiseFill{height:100%;width:0%;background:#00eaff;border-radius:8px}
+#damage{position:fixed;inset:0;background:red;opacity:0;pointer-events:none;transition:.2s}
 </style>
 </head>
 <body>
 
 <div id="damage"></div>
 <div id="ui">
-  <button id="btn">INICIAR MR</button>
-  <div id="hud">ESQUIVADAS: 0</div>
+  <button id="btn">INICIAR DEMO MR</button>
+  <div id="hud">MISSION: CROSS WITHOUT WAKING THEM
+NOISE LEVEL: LOW</div>
+  <div id="noise"><div id="noiseFill"></div></div>
 </div>
 
 <script type="importmap">
@@ -30,24 +36,28 @@ import * as THREE from 'three';
 
 let scene,camera,renderer,xrSession,xrRefSpace;
 const clock=new THREE.Clock();
+
 const btn=document.getElementById('btn');
 const hud=document.getElementById('hud');
+const noiseFill=document.getElementById('noiseFill');
 const dmg=document.getElementById('damage');
 
-const snakes=[];
-const roomPlanes=new Map();
-let score=0,gameOver=false;
+let noise=0;
+let lastCamPos=new THREE.Vector3();
+let alerted=false;
 
-const MAT_WALL=new THREE.MeshBasicMaterial({color:0x00ffff,transparent:true,opacity:.12,side:THREE.DoubleSide,depthWrite:false});
-const MAT_FLOOR=new THREE.MeshBasicMaterial({color:0x00ff00,transparent:true,opacity:.10,side:THREE.DoubleSide,depthWrite:false});
-const MAT_CEIL=new THREE.MeshBasicMaterial({color:0xff00ff,transparent:true,opacity:.10,side:THREE.DoubleSide,depthWrite:false});
+const sleepingSnakes=[];
+let activeSnake=null;
 
+// ================= INIT =================
 init();
-
 function init(){
   scene=new THREE.Scene();
-  camera=new THREE.PerspectiveCamera(70,innerWidth/innerHeight,.01,30);
-  scene.add(new THREE.HemisphereLight(0xffffff,0x444444,1.3));
+  camera=new THREE.PerspectiveCamera(70,innerWidth/innerHeight,.01,40);
+
+  scene.add(new THREE.HemisphereLight(0xffffff,0x444444,1.2));
+  const dir=new THREE.DirectionalLight(0xffffff,1.5);
+  dir.position.set(2,3,1);scene.add(dir);
 
   renderer=new THREE.WebGLRenderer({alpha:true,antialias:true});
   renderer.xr.enabled=true;
@@ -55,114 +65,130 @@ function init(){
   renderer.setSize(innerWidth,innerHeight);
   document.body.appendChild(renderer.domElement);
 
+  buildVirtualRoom();
+
   btn.onclick=startMR;
   addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight)});
   renderer.setAnimationLoop(render);
 }
 
+// ============= ROOM =====================
+function buildVirtualRoom(){
+  const g=new THREE.Group();scene.add(g);
+  const wallMat=new THREE.MeshBasicMaterial({color:0x00ffff,transparent:true,opacity:.08,side:THREE.DoubleSide});
+  const floorMat=new THREE.MeshBasicMaterial({color:0x00ff00,transparent:true,opacity:.08,side:THREE.DoubleSide});
+
+  const floor=new THREE.Mesh(new THREE.PlaneGeometry(6,6),floorMat);
+  floor.rotation.x=-Math.PI/2;g.add(floor);
+
+  const ceil=new THREE.Mesh(new THREE.PlaneGeometry(6,6),floorMat);
+  ceil.rotation.x=Math.PI/2;ceil.position.y=2.7;g.add(ceil);
+
+  const wall=new THREE.Mesh(new THREE.PlaneGeometry(6,2.7),wallMat);
+  wall.position.z=-3;wall.position.y=1.35;g.add(wall);
+}
+
+// ============= MR ======================
 async function startMR(){
-  xrSession=await navigator.xr.requestSession('immersive-ar',{
-    requiredFeatures:['local-floor'],
-    optionalFeatures:['plane-detection','dom-overlay'],
-    domOverlay:{root:document.body}
-  });
+  xrSession=await navigator.xr.requestSession('immersive-ar',{requiredFeatures:['local-floor']});
   renderer.xr.setSession(xrSession);
   xrRefSpace=await xrSession.requestReferenceSpace('local-floor');
+
   btn.style.display='none';
-  hud.style.display='block';
-  score=0;gameOver=false;
+  spawnSleepingSnakes();
 }
 
-function updateRoomPlanes(frame){
-  if(!xrSession?.detectedPlanes)return;
-  for(const [p,e] of roomPlanes){ if(!xrSession.detectedPlanes.has(p)){scene.remove(e.mesh);roomPlanes.delete(p);} }
-  for(const p of xrSession.detectedPlanes){
-    let e=roomPlanes.get(p);
-    if(!e){
-      e={mesh:new THREE.Mesh(new THREE.PlaneGeometry(1,1),MAT_WALL),right:new THREE.Vector3(),up:new THREE.Vector3(),normal:new THREE.Vector3()};
-      scene.add(e.mesh);roomPlanes.set(p,e);
-    }
-    const pose=frame.getPose(p.planeSpace,xrRefSpace); if(!pose)continue;
-    const m=new THREE.Matrix4().fromArray(pose.transform.matrix);
-    e.mesh.position.setFromMatrixPosition(m);
-    e.mesh.quaternion.setFromRotationMatrix(m);
-    e.right.set(1,0,0).applyQuaternion(e.mesh.quaternion);
-    e.up.set(0,1,0).applyQuaternion(e.mesh.quaternion);
-    e.normal.set(0,0,1).applyQuaternion(e.mesh.quaternion);
-    const dot=Math.abs(e.up.dot(new THREE.Vector3(0,1,0)));
-    e.mesh.material = dot>.85 ? (e.mesh.position.y>1.8?MAT_CEIL:MAT_FLOOR) : MAT_WALL;
-    e.mesh.geometry.dispose();
-    e.mesh.geometry=new THREE.PlaneGeometry(4, dot>.85?4:2.6);
-  }
-}
-
-function createSnake(){
+// ========== SNAKES =====================
+function createSnake(color=0xff5533,scale=1){
   const g=new THREE.Group();
   const segs=[];
-  for(let i=0;i<18;i++){
-    const r=THREE.MathUtils.lerp(.04,.015,i/17);
-    const geo=new THREE.CylinderGeometry(r*.8,r,.09,10);
+  for(let i=0;i<20;i++){
+    const r=THREE.MathUtils.lerp(.05,.02,i/19)*scale;
+    const geo=new THREE.CylinderGeometry(r*.8,r,.1,8);
     geo.rotateX(Math.PI/2);
-    const m=new THREE.MeshStandardMaterial({color:0xff3333,roughness:.4});
+    const m=new THREE.MeshStandardMaterial({color,roughness:.4});
     const s=new THREE.Mesh(geo,m);
-    s.position.z=-i*.09;
+    s.position.z=-i*.1;
     g.add(s);segs.push(s);
   }
-  const head=new THREE.Mesh(new THREE.ConeGeometry(.06,.12,12).rotateX(Math.PI/2),new THREE.MeshStandardMaterial({color:0x111111}));
-  g.add(head);
   scene.add(g);
   return {g,segs,trail:[],t:0};
 }
 
-function spawnSnake(){
-  const walls=[...roomPlanes.values()].filter(e=>e.mesh.material===MAT_WALL);
-  if(!walls.length)return;
-  const w=walls[Math.random()*walls.length|0];
-  const u=(Math.random()*2-1)*1.8;
-  const v=Math.random()*2.2;
-  const pos=w.mesh.position.clone().add(w.right.clone().multiplyScalar(u)).add(w.up.clone().multiplyScalar(v));
-  const s=createSnake();
-  s.wall=w;
-  s.pos=pos.clone().add(w.normal.clone().multiplyScalar(-.3));
-  s.g.position.copy(s.pos);
-  snakes.push(s);
+function spawnSleepingSnakes(){
+  for(let i=0;i<12;i++){
+    const s=createSnake(0xff5533,.8);
+    s.g.position.set((Math.random()-0.5)*4,0.05,(Math.random()-0.5)*4);
+    s.sleeping=true;
+    sleepingSnakes.push(s);
+  }
+}
+// ============ ACTIVE SNAKE ===============
+function spawnWallSnake(){
+  const s=createSnake(0x8d5a2b,1.6);
+  s.wallNormal=new THREE.Vector3(0,0,1);
+  s.wallPos=new THREE.Vector3(0,1.4,-3);
+  s.g.position.copy(s.wallPos).add(s.wallNormal.clone().multiplyScalar(-0.6));
+  s.phase="emerge";
+  activeSnake=s;
 }
 
-function updateSnakes(dt){
-  const player=new THREE.Vector3();camera.getWorldPosition(player);
-  for(let i=snakes.length-1;i>=0;i--){
-    const s=snakes[i];s.t+=dt;
-    if(s.t<.6)s.pos.addScaledVector(s.wall.normal,dt*.6);
-    else{
-      const u=Math.sin(s.t*.5)*1.6;
-      const v=.5+Math.sin(s.t*.3)*1.1;
-      s.pos=s.wall.mesh.position.clone().add(s.wall.right.clone().multiplyScalar(u)).add(s.wall.up.clone().multiplyScalar(v));
-    }
-    s.trail.unshift(s.pos.clone());
-    if(s.trail.length>80)s.trail.pop();
-    s.g.position.copy(s.pos);
-    for(let j=0;j<s.segs.length;j++){
-      const p=s.trail[Math.min(j*4,s.trail.length-1)];
-      if(!p)continue;
-      const local=s.g.worldToLocal(p.clone());
-      local.x+=Math.sin(s.t*6-j*.5)*.04;
-      s.segs[j].position.copy(local);
-    }
-    if(s.pos.distanceTo(player)<.35&&!gameOver){
-      gameOver=true;
-      dmg.style.opacity=.7;
-      setTimeout(()=>dmg.style.opacity=0,200);
-    }
-    if(s.t>8){scene.remove(s.g);snakes.splice(i,1);score++;hud.textContent=`ESQUIVADAS: ${score}`;}
+// ============ UPDATE =====================
+function updateNoise(dt){
+  const camPos=new THREE.Vector3();camera.getWorldPosition(camPos);
+  const speed=camPos.distanceTo(lastCamPos)/dt;
+  lastCamPos.copy(camPos);
+  noise+=speed*0.05;
+  noise=Math.max(0,noise-dt*0.3);
+  noiseFill.style.width=Math.min(100,noise*100)+"%";
+  hud.textContent=`MISSION: CROSS WITHOUT WAKING THEM\nNOISE LEVEL: ${noise<.3?"LOW":noise<.7?"MED":"HIGH"}`;
+
+  if(noise>1 && !alerted){
+    alerted=true;
+    spawnWallSnake();
   }
 }
 
-function render(t,frame){
+function updateSnake(s,dt){
+  s.t+=dt;
+  if(s.phase==="emerge"){
+    s.g.position.addScaledVector(s.wallNormal,dt*0.4);
+    if(s.t>1){s.phase="crawl";s.t=0;}
+  }
+  else if(s.phase==="crawl"){
+    const x=Math.sin(s.t*.5)*1.6;
+    s.g.position.set(x,1.4,-2.8);
+    if(s.t>4){s.phase="attack";s.t=0;}
+  }
+  else if(s.phase==="attack"){
+    const dir=new THREE.Vector3();camera.getWorldPosition(dir);
+    dir.sub(s.g.position).normalize();
+    s.g.position.addScaledVector(dir,dt*1.2);
+    if(s.t>1.2){s.phase="retreat";s.t=0;}
+  }
+  else if(s.phase==="retreat"){
+    s.g.position.addScaledVector(s.wallNormal,-dt*0.8);
+    if(s.t>1){scene.remove(s.g);activeSnake=null;}
+  }
+
+  s.trail.unshift(s.g.position.clone());
+  if(s.trail.length>120)s.trail.pop();
+
+  for(let i=0;i<s.segs.length;i++){
+    const p=s.trail[Math.min(i*4,s.trail.length-1)];
+    if(!p)continue;
+    const local=s.g.worldToLocal(p.clone());
+    local.x+=Math.sin(s.t*3-i*.4)*.06;
+    s.segs[i].position.copy(local);
+  }
+}
+
+// ============ RENDER =====================
+function render(){
   const dt=Math.min(.05,clock.getDelta());
-  if(frame){
-    updateRoomPlanes(frame);
-    if(Math.random()<.01)spawnSnake();
-    updateSnakes(dt);
+  if(xrSession){
+    updateNoise(dt);
+    if(activeSnake)updateSnake(activeSnake,dt);
   }
   renderer.render(scene,camera);
 }
